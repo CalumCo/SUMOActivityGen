@@ -130,6 +130,7 @@ class ModeShare(Enum):
     """
     PROBABILITY = 1
     WEIGHT = 2
+    INTERMODAL = 3
 
 class MobilityGenerator():
     """ Generates intermodal mobility for SUMO starting from a synthetic population. """
@@ -146,6 +147,11 @@ class MobilityGenerator():
     _sumo_parkings = collections.defaultdict(list)
     _parking_cache = dict()
     _parking_position = dict()
+
+    _sumo_stops = collections.defaultdict(list)
+    _stop_cache = dict()
+    _stop_position = dict()
+
     _taz_weights = dict()
     _buildings_by_taz = dict()
     _edges_by_taz = dict()
@@ -169,6 +175,8 @@ class MobilityGenerator():
             self._mode_interpr = ModeShare.PROBABILITY
         elif conf['intermodalOptions']['modeSelection'] == 'WEIGHT':
             self._mode_interpr = ModeShare.WEIGHT
+        elif conf['intermodalOptions']['modeSelection'] == 'INTERMODAL':
+            self._mode_interpr = ModeShare.INTERMODAL
         else:
             raise Exception('The parameter "modeSelection" in "intermodalOptions" must be set to '
                             '"PROBABILITY" or "WEIGHT".')
@@ -188,6 +196,9 @@ class MobilityGenerator():
 
         logging.info('Loading SUMO parking lots from file %s', conf['SUMOadditionals']['parkings'])
         self._load_parkings(conf['SUMOadditionals']['parkings'])
+
+        logging.info('Loading SUMO bus and/or train stops from file %s', conf['SUMOadditionals']['stops'])
+        self._load_stops(conf['SUMOadditionals']['stops'])
 
         logging.info('Loading TAZ weights from %s', conf['population']['tazWeights'])
         self._load_weights_from_csv(conf['population']['tazWeights'])
@@ -223,6 +234,17 @@ class MobilityGenerator():
     ## ---------------------------------------------------------------------------------------- ##
     ##                                          Loaders                                         ##
     ## ---------------------------------------------------------------------------------------- ##
+
+    def _load_stops(self, filename):
+        """ Load public bus and train stops from XML file. """
+        xml_tree = xml.etree.ElementTree.parse(filename).getroot()
+        for child in xml_tree:
+            if child.tag != 'busStop':
+                continue
+            edge = child.attrib['lane'].split('_')[0]
+            position = float(child.attrib['startPos']) + 2.5
+            self._sumo_stops[edge].append(child.attrib['id'])
+            self._stop_position[child.attrib['id']] = position
 
     def _load_parkings(self, filename):
         """ Load parkings ids from XML file. """
@@ -334,11 +356,12 @@ class MobilityGenerator():
             ## Activity chains preparation
             activity_chains = []
             activity_chains_weights = []
+            _change = self._conf['SUMOintermodalRoutes']
+            toPrint = self._conf['SUMOintermodalRoutes']
             for _weight, _chain, _modes in m_slice['activityChains']:
                 activity_chains.append((_chain, _modes))
                 activity_chains_weights.append(_weight)
             activity_index = [i for i in range(len(activity_chains))]
-
             if self._profiling:
                 _pr = cProfile.Profile()
                 _pr.enable()
@@ -362,8 +385,7 @@ class MobilityGenerator():
                         _final_chain, _stages, _selected_mode = self._generate_trip(
                             self._conf['taz'][m_slice['loc_origin']],
                             self._conf['taz'][m_slice['loc_primary']],
-                            _chain, _modes)
-
+                            _chain, _modes, _change)
                         ## Generating departure time
                         _depart = numpy.round(_final_chain[1].start, decimals=2)
                         if _depart < 0.0:
@@ -391,9 +413,7 @@ class MobilityGenerator():
                             'depart': _depart,
                             'stages': _stages,
                         }
-
                         complete_trip = self._generate_sumo_trip_from_activitygen(_person_trip)
-
                         _person_trip['string'] = complete_trip
                         ## For statistical purposes.
                         _modes_stats[_selected_mode] += 1
@@ -433,16 +453,103 @@ class MobilityGenerator():
         for chain, value in _chains_stats.items():
             logging.info('\t %s: %d (%.2f).', chain, value, float(value/total))
 
+    ## ---- Bus/Train STOPS: location and selection ---- ##
+
+    def _get_rand_stop(self, edge, cost):
+        """ Given a edge find a random stop a certain distance from that edge """
+        MaxCost = cost
+        costOfTrip = None
+        Int = len(self._sumo_stops)
+        rand = self._random_generator.randint(Int) - 1
+        listStops= list(self._sumo_stops)
+        s_id = listStops[rand]
+        s_edge = self._sumo_stops.get(s_id)
+        ret = None
+        route = traci.simulation.findIntermodalRoute(
+            s_edge, edge, pType="public")
+        if route:
+            route = list(route)
+            costOfTrip = self._cost_from_route(route)
+        if costOfTrip < MaxCost:
+            ret = s_edge, s_id, route
+        if route:
+            return ret
+        elif  cost != sys.float_info.max:
+            MaxCost = MaxCost*2
+            ret = _get_rand_stop(edge, MaxCost)
+            return ret
+        return None
+
+
+
+
+
+    def _find_stop(self, edge, cost, mode):
+        """ Given an edge and a mode find a suitable edge for transition to a new mode. """
+        max_distance = cost
+
+        _mode, _ptype, _vtype = self._get_mode_parameters(mode)
+        stopLen = (len(self._sumo_stops)-1)
+        rand = self._random_generator.randint(stopLen)
+        s_id = None
+        i = 0
+        ret = []
+        if mode == 'public':
+            edgeInfo = self._sumo_stops
+        else:
+            edgeInfo = self._sumo_parkings
+
+        SHOULDBREAK = None
+        for s_edge, stops in edgeInfo.items():
+            for stop in stops:
+                if SHOULDBREAK:
+                    break
+                if rand == i:
+                    s_id = stop
+                    if s_id:
+                        try:
+                            route = traci.simulation.findIntermodalRoute(
+                                s_edge, edge, pType=_ptype, vType = _vtype)
+                        except traci.exceptions.TraCIException:
+                            route = None
+                        if route and not isinstance(route, list):
+                            # list in until SUMO 1.4.0 included, tuple onward
+                            route = list(route)
+                        if route:
+                            cost = self._cost_from_route(route)
+                            if cost <= max_distance:
+                                ret = s_id, s_edge, route, mode
+                                SHOULDBREAK = "true"
+                                break
+                else:
+                    i = i + 1
+                    if i == stopLen:
+                        rand = 0
+                        i = rand
+
+
+        #ret = self._get_rand_stop(edge, cost)
+        if ret:
+            return ret
+
+        logging.fatal('Edge %s is not reachable from any bus/train stop.', edge)
+        self._blacklisted_edges.add(edge)
+        return None, None, None, None
+
+
+
+
     ## ---- PARKING AREAS: location and selection ---- ##
 
     def _check_parkings_cache(self, edge):
         """ Check among the previously computed results of _find_closest_parking """
+
         if edge in self._parking_cache.keys():
             return self._parking_cache[edge]
         return None
 
     def _find_closest_parking(self, edge):
-        """ Given and edge, find the closest parking area. """
+        """ Given an edge, find the closest parking area. """
         distance = sys.float_info.max
 
         ret = self._check_parkings_cache(edge)
@@ -479,19 +586,28 @@ class MobilityGenerator():
         self._blacklisted_edges.add(edge)
         return None, None, None
 
+
+
+
     ## ---- Functions for _compute_trips_per_slice: _generate_trip, _generate_mode_traci ---- ##
 
     def _generate_mode_traci(self, from_area, to_area, activity_chain, mode):
         """ Return the person trip for a given mode generated with TraCI """
-        _person_stages = self._generate_person_stages(from_area, to_area, activity_chain, mode)
+        if self._mode_interpr == ModeShare.INTERMODAL:
+            _person_stages = self._generate_person_stages(from_area, to_area, activity_chain, mode[0][0])
+            _mode, _ptype, _vtype = self._get_mode_parameters(mode[0][0])
 
+        else:
+            _person_stages = self._generate_person_stages(from_area, to_area, activity_chain, mode)
+            _mode, _ptype, _vtype = self._get_mode_parameters(mode)
         _person_steps = []
         _new_start_time = None
 
-        _mode, _ptype, _vtype = self._get_mode_parameters(mode)
+
 
         for pos in range(1, len(_person_stages)+1):
             stage = _person_stages[pos]
+            currentMode = mode[pos-1]
             logging.debug('STAGE %d: %s', pos, pformat(stage))
             # findIntermodalRoute(self, fromEdge, toEdge, modes='', depart=-1.0,
             #                     routingMode=0, speed=-1.0, walkFactor=-1.0,
@@ -552,6 +668,67 @@ class MobilityGenerator():
                     ## update the next stage to make it start from the parking
                     if pos + 1 in _person_stages:
                         _person_stages[pos+1] = _person_stages[pos+1]._replace(fromEdge=p_edge)
+
+            elif (self._mode_interpr == ModeShare.INTERMODAL):
+
+                route = traci.simulation.findIntermodalRoute(stage.fromEdge, stage.toEdge, pType=currentMode[0])
+                route = list(route)
+                destEdge = stage.toEdge
+                currentMode.reverse()
+                routeLeg = [[] for i in range(4)]
+                tripStart = None
+                finalEdge = []
+                for x in range(len(currentMode)):
+                    thisMode = currentMode[x]
+                    _mode, _ptype, _vtype = self._get_mode_parameters(thisMode)
+                    costOfTotal = self._cost_from_route(route)
+                    if ((len(currentMode)-1) - (x)) == 0:
+                         tripStart = traci.simulation.findIntermodalRoute(stage.fromEdge, destEdge,
+                         pType=_ptype, vType =_vtype)
+                         modeUsed = thisMode
+                         finalEdge = destEdge
+
+                    else:
+                        p_id, p_edge, _last_mile, modeUsed = self._find_stop(destEdge, costOfTotal, thisMode)
+                        compRoute = p_id, p_edge, _last_mile, modeUsed
+
+                        routeLeg[0].append(p_id)
+                        routeLeg[1].append(p_edge)
+                        routeLeg[2].append(_last_mile)
+                        routeLeg[3].append(modeUsed)
+                        if p_edge:
+                            destEdge = p_edge
+
+
+                    if tripStart:
+                        route = tripStart
+                        if route and not isinstance(route, list):
+                            # list in until SUMO 1.4.0 included, tuple onward
+                            route = list(route)
+                        lenOfJoy = (len(routeLeg[0]))
+                        for x in range(lenOfJoy):
+                            if routeLeg[2][lenOfJoy - (x+1)]:
+                                route[-1].destStop = routeLeg[0][lenOfJoy - (x+1)]
+                                if routeLeg[3][lenOfJoy - (x+1)] == 'public':
+                                    route[-1].arrivalPos = self._stop_position[routeLeg[0][lenOfJoy - (x+1)]]
+                                else:
+                                    route[-1].arrivalPos = self._parking_position[routeLeg[0][lenOfJoy - (x+1)]]
+                                route.extend(routeLeg[2][lenOfJoy - (x+1)])
+                                finalEdge = routeLeg[1][-1]
+
+                        if route:
+                            ## build the waiting to destination (if required)
+                            if stage.duration:
+                                route.append(self._generate_waiting_stage(stage))
+
+                            if route and not isinstance(route, list):
+                                # list in until SUMO 1.4.0 included, tuple onward
+                                route = list(route)
+
+                        ## update the next stage to make it start from the Stop
+                if pos + 1 in _person_stages:
+                    _person_stages[pos+1] = _person_stages[pos+1]._replace(fromEdge=finalEdge)
+
             else:
                 ## PUBLIC, ON-DEMAND, trip to HOME, and NO-PARKING required vehicles.
                 route = traci.simulation.findIntermodalRoute(
@@ -586,12 +763,11 @@ class MobilityGenerator():
 
             ## Add the stage to the full planned trip.
             for step in route:
-                _new_start_time += step.travelTime
+                #_new_start_time += step.travelTime
                 _person_steps.append(step)
-
         return _person_steps, _person_stages
 
-    def _generate_trip(self, from_area, to_area, activity_chain, modes):
+    def _generate_trip(self, from_area, to_area, activity_chain, modes, change):
         """ Returns the trip for the given activity chain. """
 
         trip = None
@@ -606,29 +782,54 @@ class MobilityGenerator():
                 _probs.append(prob)
             selection = self._random_generator.choice(_vals, p=_probs)
             _interpr_modes = [[selection, 1.0]] ## Unique mode, without weight.
+
+        elif self._mode_interpr == ModeShare.INTERMODAL:
+            _interpr_modes = change
         else:
             _interpr_modes = modes
 
-        for mode, weight in _interpr_modes:
+        if self._mode_interpr == ModeShare.INTERMODAL:
+
             _person_steps = None
             _error_counter = 0
-            while not _person_steps and _error_counter < self._max_retry_number:
+            while not _person_steps:
                 try:
                     _person_steps, _person_stages = self._generate_mode_traci(
-                        from_area, to_area, activity_chain, mode)
+                        from_area, to_area, activity_chain, _interpr_modes)
                 except TripGenerationGenericError:
                     _person_steps = None
                     _error_counter += 1
 
             if _person_steps:
                 ## Cost computation.
-                solutions.append((self._cost_from_route(_person_steps) * weight,
-                                  _person_steps, _person_stages, mode))
+                solutions.append((self._cost_from_route(_person_steps),
+                                  _person_steps, _person_stages, _interpr_modes[0][0]))
             else:
                 logging.critical(
                     '_generate_mode_traci from "%s" to "%s" with "%s" generated %d errors, '
                     'trip generation aborted..',
-                    from_area, to_area, mode, _error_counter)
+                    from_area, to_area, _interpr_modes, _error_counter)
+        else:
+            for mode, weight in _interpr_modes:
+                _person_steps = None
+                _error_counter = 0
+                while not _person_steps and _error_counter < self._max_retry_number:
+                    try:
+                        _person_steps, _person_stages = self._generate_mode_traci(
+                            from_area, to_area, activity_chain, mode)
+                    except TripGenerationGenericError:
+                        _person_steps = None
+                        _error_counter += 1
+
+                if _person_steps:
+                    ## Cost computation.
+                    solutions.append((self._cost_from_route(_person_steps) * weight,
+                                      _person_steps, _person_stages, mode))
+                else:
+                    logging.critical(
+                        '_generate_mode_traci from "%s" to "%s" with "%s" generated %d errors, '
+                        'trip generation aborted..',
+                        from_area, to_area, mode, _error_counter)
 
         ## Compose the final person trip.
         if solutions:
@@ -636,7 +837,7 @@ class MobilityGenerator():
             best = sorted(solutions)[0] ## Ascending.
             trip = (best[2], best[1], best[3]) ## _person_stages, _person_steps, mode
         else:
-            raise TripGenerationRouteError('No solution foud for chain {} and modes {}.'.format(
+            raise TripGenerationRouteError('No solution found for chain {} and modes {}.'.format(
                 activity_chain, _interpr_modes))
         return trip
 
@@ -749,7 +950,7 @@ class MobilityGenerator():
             ett, route = None, None
             try:
                 route = traci.simulation.findIntermodalRoute(
-                    person_stages[pos].fromEdge, person_stages[pos].toEdge, 
+                    person_stages[pos].fromEdge, person_stages[pos].toEdge,
                     modes=_mode, pType=_ptype, vType=_vtype)
                 ett = self._ett_from_route(route)
             except traci.exceptions.TraCIException:
@@ -1105,7 +1306,7 @@ class MobilityGenerator():
             Parameters: _mode, _ptype, _vtype
         """
         if mode == 'public':
-            return 'public', '', ''
+            return 'public', '', 'bus'
         if mode == 'bicycle':
             return 'bicycle', '', 'bicycle'
         if mode == 'walk':
@@ -1311,18 +1512,14 @@ class MobilityGenerator():
                             _triggered_route.extend(stage.edges)
                         _triggered_vtype = stage.vType
                         _stop = ''
-                        # print(stage.travelTime, stage.destStop)
                         if stage.travelTime == LAST_STOP_PLACEHOLDER:
-                            # print('final stop')
                             _stop = self.FINAL_STOP.format(
                                 lane=self._get_stopping_lane(stage.edges[-1]))
                         else:
                             if stage.destStop:
-                                # print('parking')
                                 _stop = self.STOP_PARKING_TRIGGERED.format(
                                     id=stage.destStop, person=person['id'])
                             else:
-                                # print('side edge')
                                 start = stage.arrivalPos - self._conf['stopBufferDistance'] / 2.0
                                 end = stage.arrivalPos + self._conf['stopBufferDistance'] / 2.0
                                 _stop = self.STOP_EDGE_TRIGGERED.format(

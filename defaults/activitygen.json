@@ -1,7 +1,7 @@
 {
     "seed": 42,
     "maxNumTry": 10,
-    "outputPrefix": "osm_activitygen",
+    "outputPrefix": "osm_activitygen.",
     "mergeRoutesFiles": true,
 
     "sumocfg": "duarouter.sumocfg",
@@ -9,13 +9,14 @@
     "SUMOnetFile": "osm.net.xml",
     "SUMOadditionals": {
         "vTypes": "basic.vType.xml",
-        "parkings": "osm_complete_parking_areas.add.xml"
+        "parkings": "osm_complete_parking_areas.add.xml",
+        "stops": "osm_stops.add.xml"
     },
 
     "intermodalOptions": {
         "parkingAreaBlacklist": [],
         "vehicleAllowedParking": ["passenger", "motorcycle", "evehicle"],
-        "modeSelection": "PROBABILITY"
+        "modeSelection": "INTERMODAL"
     },
 
     "population": {
@@ -98,5 +99,7 @@
     },
 
     "minEdgeAllowed": 30.0,
-    "stopBufferDistance": 20.0
+    "stopBufferDistance": 20.0,
+
+    "SUMOintermodalRoutes": [["public"],[ "bicycle"],["passenger"], ["on-demand"]]
 }
