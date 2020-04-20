@@ -1,6 +1,6 @@
 {
     "seed": 42,
-    "maxNumTry": 10,
+    "maxNumTry": 1000,
     "outputPrefix": "osm_activitygen.",
     "mergeRoutesFiles": true,
 
@@ -16,6 +16,7 @@
     "intermodalOptions": {
         "parkingAreaBlacklist": [],
         "vehicleAllowedParking": ["passenger", "motorcycle", "evehicle"],
+        "intermodalVehiclesAllowed": ["passenger", "motorcycle", "evehicle", "truck", "trailer", "coach", "on-demand"],
         "modeSelection": "INTERMODAL"
     },
 
@@ -101,5 +102,8 @@
     "minEdgeAllowed": 30.0,
     "stopBufferDistance": 20.0,
 
-    "SUMOintermodalRoutes": [["public"],[ "bicycle"],["passenger"], ["on-demand"]]
+    "SUMOintermodalRoutes": [
+                            [0.5, [["bicycle", "public"],["motorcycle","bicycle"],["passenger","motorcycle"],["on-demand"]]],
+                            [0.5, [["bicycle", "public"],["public", "motorcycle"],["passenger","public"],["on-demand","public"]]]
+                          ]
 }
